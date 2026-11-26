@@ -10,6 +10,10 @@ struct ggml_cuda_gated_delta_net_fused_cache {
     float * in_dst[4] = {};
     int64_t in_nb2[4] = {}; // token stride in elements
     int64_t in_nb3[4] = {}; // seq stride in elements
+
+    // state read in place (see ggml_cuda_gdn_inplace_state_rows): row indices of the skipped gather and its source
+    const int32_t * in_rows = nullptr;
+    const float *   in_base = nullptr;
 };
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

@@ -4516,6 +4516,54 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// gated_delta_net reading its state in place (agent B): the state comes from a GET_ROWS gather of the cache and
+// the fused kernel writes it back into the cache. Where the gathered row is the row the kernel writes
+// (the usual case), the gather is skipped (see k_get_rows_float_vec_skip) and the kernel reads the cache row.
+// Returns the GET_ROWS node, or nullptr when the pattern does not match.
+static const ggml_tensor * ggml_cuda_gdn_inplace_state_rows(
+        const ggml_cgraph * cgraph, int gdn_idx, ggml_cuda_gated_delta_net_fused_cache & cache) {
+    const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[6] != nullptr || ggml_get_op_params_i32(gdn, 0) != 1) {
+        return nullptr;
+    }
+    const ggml_tensor * st = gdn->src[5];
+    const ggml_tensor * gr = st->view_src;
+    const ggml_tensor * v  = gdn->src[2];
+    const int64_t D      = v->ne[0] * v->ne[0] * v->ne[1];
+    const int64_t n_seqs = v->ne[3];
+    const size_t  row    = ggml_row_size(GGML_TYPE_F32, D);
+    if (gr == nullptr || gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        st->data != gr->data || gr->src[0]->type != GGML_TYPE_F32 || gr->src[0]->nb[1] != row ||
+        gr->ne[0] != D || gr->ne[1] < n_seqs || gr->ne[2] != 1 || gr->ne[3] != 1 || gr->nb[1] != row ||
+        gr->src[1]->ne[1] != 1 || gr->src[1]->nb[0] != sizeof(int32_t)) {
+        return nullptr;
+    }
+    if (ggml_cuda_try_gdn_cache_fusion(cgraph, gdn_idx, cache) <= 0) {
+        return nullptr;
+    }
+    // the first n_seqs gathered rows may only be read by this gdn
+    const size_t low = n_seqs * row;
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * s = n->src[k];
+            if (s == nullptr || !(s == gr || (s->view_src == gr && s->view_offs < low))) {
+                continue;
+            }
+            if (n == gdn && k == 5) {
+                continue;
+            }
+            if (ggml_cuda_is_view_or_noop(n) && n->view_src == gr && !(n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                continue;
+            }
+            return nullptr;
+        }
+    }
+    cache.in_rows = (const int32_t *) gr->src[1]->data;
+    cache.in_base = (const float *) gr->src[0]->data;
+    return gr;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4556,11 +4604,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // GET_ROWS of the recurrent state for a gated_delta_net that can read the cache in place: skip the rows
+    // that are already where the kernel writes them (the following view node is skipped, it computes nothing)
+    if (node->op == GGML_OP_GET_ROWS && !ggml_cuda_env_flag("GGML_CUDA_GDN_NO_INPLACE") &&
+        i + 1 < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[i + 1])) {
+        for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (n->op == GGML_OP_GATED_DELTA_NET && n->src[5] != nullptr && n->src[5]->view_src == node) {
+                ggml_cuda_gated_delta_net_fused_cache c;
+                if (ggml_cuda_gdn_inplace_state_rows(cgraph, j, c) == node) {
+                    ggml_cuda_op_get_rows_skip(*cuda_ctx, node, c.data, n->src[2]->ne[3]);
+                    return 1;
+                }
+                break;
+            }
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {
+            if (!ggml_cuda_env_flag("GGML_CUDA_GDN_NO_INPLACE")) {
+                ggml_cuda_gdn_inplace_state_rows(cgraph, i, fused_state_cpy);
+            }
 #ifdef GGML_CUDA_DEBUG
             GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
                           __func__, node->name, nodes_to_skip);

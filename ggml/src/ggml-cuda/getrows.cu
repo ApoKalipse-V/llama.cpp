@@ -460,6 +460,45 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
 }
 
+// one block per row and 256 int4; rows that are already in place (see getrows.cuh) are left out
+static __global__ void k_get_rows_float_vec_skip(
+        const char * src0_ptr, const int32_t * src1_ptr, char * dst_ptr, const int64_t ne00v, const size_t nb01,
+        const size_t nb1, const char * skip_base, const int64_t n_skip) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const int64_t i10 = blockIdx.x;
+    const int4 * GGML_CUDA_RESTRICT src0_row = (const int4 *) (src0_ptr + (int64_t) src1_ptr[i10] * nb01);
+    if (i10 < n_skip && (const char *) src0_row == skip_base + i10 * nb01) {
+        return;
+    }
+    int4 * GGML_CUDA_RESTRICT dst_row = (int4 *) (dst_ptr + i10 * nb1);
+    for (int64_t i = blockIdx.y*blockDim.x + threadIdx.x; i < ne00v; i += gridDim.y*blockDim.x) {
+        dst_row[i] = src0_row[i];
+    }
+}
+
+void ggml_cuda_op_get_rows_skip(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const void * skip_base, int64_t n_skip) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne10 = src1->ne[0];
+    const bool ok = src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[1] == 1 && src1->ne[2] == 1 &&
+        ne00 % 4 == 0 && src0->nb[1] % 16 == 0 && dst->nb[1] % 16 == 0 &&
+        ((uintptr_t) src0->data) % 16 == 0 && ((uintptr_t) dst->data) % 16 == 0 && ((uintptr_t) skip_base) % 16 == 0;
+    if (!ok) {
+        ggml_cuda_op_get_rows(ctx, dst);
+        return;
+    }
+    const int64_t ne00v = ne00 / 4;
+    const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+    // most rows are skipped, so keep the grid small: 16 blocks per row (a copied row loops in its threads)
+    const dim3 block_nums(ne10, MIN((ne00v + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, 16), 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, ctx.stream()};
+    ggml_cuda_kernel_launch(k_get_rows_float_vec_skip, launch_params,
+        (const char *) src0->data, (const int32_t *) src1->data, (char *) dst->data, ne00v, src0->nb[1],
+        dst->nb[1], (const char *) skip_base, n_skip);
+}
+
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0]; // gradients of forward pass output
     const ggml_tensor * src1 = dst->src[1]; // src1 in forward pass

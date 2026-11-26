@@ -13,3 +13,6 @@ void get_rows_cuda(
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// GET_ROWS of F32 rows that leaves out every row i < n_skip whose source row is at skip_base + i*row_size
+void ggml_cuda_op_get_rows_skip(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const void * skip_base, int64_t n_skip);

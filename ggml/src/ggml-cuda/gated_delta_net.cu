@@ -22,6 +22,11 @@ struct gdn_replay_args {
     float *         st[4];
     int64_t         st2[4]; // token stride in floats
     int64_t         st3[4]; // seq stride in floats
+
+    // optional: the state was gathered from in_base by rows in_rows, and the gather skipped every sequence
+    // whose row is the one this kernel writes; such a sequence reads its state from the output
+    const int32_t * in_rows;
+    const float *   in_base;
 };
 
 template <int S_v, bool KDA, bool keep_rs_t, bool replay = false, int cols_per_warp = gdn_cols_per_warp>
@@ -77,6 +82,10 @@ gated_delta_net_cuda(const float * q,
     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
     const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
+    if (rep.in_rows != nullptr &&
+        rep.in_base + (int64_t) rep.in_rows[sequence] * (H * S_v * S_v) == state + (int64_t) sequence * (H * S_v * S_v)) {
+        curr_state = state;
+    }
     state += state_out_offset;
     curr_state += state_in_offset + col * S_v;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
@@ -451,6 +460,10 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const ggml_tensor * src_pend  = dst->src[6];
 
     gdn_replay_args rep = {};
+    if (cache != nullptr && !src_pend && !keep_rs) {
+        rep.in_rows = cache->in_rows;
+        rep.in_base = cache->in_base;
+    }
     if (src_pend) {
         const ggml_tensor * src_pv  = dst->src[7];
         const ggml_tensor * src_pgb = dst->src[8];
@@ -486,7 +499,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
         sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, REP, stream)
 #define GDN_LAUNCH(KDA, KEEP, REPLAY) GDN_LAUNCH_N(KDA, KEEP, REPLAY, n_tokens, rep)
 
-    if (!src_pend) {
+    if (!src_pend && rep.in_rows == nullptr) {
         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
         args.state_out = state_d;
         if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
