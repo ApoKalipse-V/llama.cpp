@@ -1433,6 +1433,14 @@ struct ggml_backend_cuda_context {
 
     std::unique_ptr<ggml_cuda_stream_context> concurrent_stream_context;
 
+    // q8_1 copy of the last quantized matrix-vector input (see mmvq.cu); valid within one graph compute
+    struct {
+        const ggml_tensor * src1   = nullptr;
+        cudaStream_t        stream = nullptr;
+        void              * buf    = nullptr;
+        size_t              size   = 0;
+    } q8_1_cache;
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {

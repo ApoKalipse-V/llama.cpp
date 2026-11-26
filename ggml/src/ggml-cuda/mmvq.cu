@@ -1535,36 +1535,24 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
-struct ggml_cuda_q8_1_cache {
-    const void        * ctx    = nullptr;
-    const ggml_tensor * src1   = nullptr;
-    cudaStream_t        stream = nullptr;
-    void              * buf    = nullptr;
-    size_t              size   = 0;
-    int                 device = -1;
-};
-static thread_local ggml_cuda_q8_1_cache ggml_cuda_q8_1_cache_tls;
-
-void ggml_cuda_mmvq_q8_1_cache_reset() {
-    ggml_cuda_q8_1_cache_tls.src1 = nullptr;
+void ggml_cuda_mmvq_q8_1_cache_reset(ggml_backend_cuda_context & ctx) {
+    ctx.q8_1_cache.src1 = nullptr;
 }
 
 // Returns the buffer for the quantized copy of src1 and makes src1 its owner. *hit is set when the
 // buffer already holds src1 (then the caller must not write it again).
 void * ggml_cuda_mmvq_q8_1_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, size_t size, cudaStream_t stream, bool * hit) {
-    ggml_cuda_q8_1_cache & q8c = ggml_cuda_q8_1_cache_tls;
-    *hit = q8c.ctx == &ctx && q8c.src1 == src1 && q8c.stream == stream;
+    auto & q8c = ctx.q8_1_cache;
+    *hit = q8c.src1 == src1 && q8c.stream == stream;
     if (!*hit) {
-        if (q8c.size < size || q8c.device != ctx.device) {
+        if (q8c.size < size) {
             if (q8c.buf != nullptr) {
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 CUDA_CHECK(cudaFree(q8c.buf));
             }
             CUDA_CHECK(cudaMalloc(&q8c.buf, size));
-            q8c.size   = size;
-            q8c.device = ctx.device;
+            q8c.size = size;
         }
-        q8c.ctx    = &ctx;
         q8c.src1   = src1;
         q8c.stream = stream;
     }

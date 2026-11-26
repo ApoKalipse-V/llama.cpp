@@ -465,11 +465,6 @@ static void group_norm_f32_cuda(
     }
 }
 
-// Set by ggml_cuda_op_rms_norm_fused when its single-row F32 result may feed a quantized matrix-vector
-// product: the kernel then also writes the q8_1 copy, which saves the quantize_q8_1 dispatch.
-static thread_local ggml_backend_cuda_context * rms_norm_q8_1_ctx    = nullptr;
-static thread_local const ggml_tensor         * rms_norm_q8_1_tensor = nullptr;
-
 #define RMS_NORM_LAUNCH(BLOCK_SIZE, VPT, VEC) \
     do { \
         const dim3 block_dims(BLOCK_SIZE, 1, 1); \
@@ -491,7 +486,10 @@ static void rms_norm_f32_dispatch(
         const uint3    mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
         const ggml_tensor * add_t, const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
         const uint3    add_ncols_packed, const uint3 add_nrows_packed, const uint3 add_nchannels_packed, const uint3 add_nsamples_packed,
-        cudaStream_t   stream, const float scale_out = 1.0f) {
+        cudaStream_t   stream, const float scale_out = 1.0f,
+        // When set, the single-row F32 result may feed a quantized matrix-vector product: the kernel then
+        // also writes the q8_1 copy for q8_tensor, which saves the quantize_q8_1 dispatch.
+        ggml_backend_cuda_context * q8_ctx = nullptr, const ggml_tensor * q8_tensor = nullptr) {
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
     static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
 
@@ -513,11 +511,10 @@ static void rms_norm_f32_dispatch(
 
     const int n4 = ncols / 4;
     void * q8 = nullptr;
-    if (rms_norm_q8_1_tensor != nullptr && vec && n4 <= 1024 && do_multiply && !do_add && std::is_same_v<T, float>) {
+    if (q8_tensor != nullptr && vec && n4 <= 1024 && do_multiply && !do_add && std::is_same_v<T, float>) {
         bool hit = false;
-        q8 = ggml_cuda_mmvq_q8_1_cache_claim(*rms_norm_q8_1_ctx, rms_norm_q8_1_tensor, ncols * sizeof(block_q8_1) / QK8_1, stream, &hit);
+        q8 = ggml_cuda_mmvq_q8_1_cache_claim(*q8_ctx, q8_tensor, ncols * sizeof(block_q8_1) / QK8_1, stream, &hit);
     }
-    rms_norm_q8_1_tensor = nullptr;
     if (vec) {
         if (n4 <= 32) {
             RMS_NORM_LAUNCH(32,   1, true);
@@ -582,7 +579,9 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
                                   const uint32_t add_nchannels,
                                   const uint32_t add_nsamples,
                                   const float    eps,
-                                  cudaStream_t   stream) {
+                                  cudaStream_t   stream,
+                                  ggml_backend_cuda_context * q8_ctx    = nullptr,
+                                  const ggml_tensor         * q8_tensor = nullptr) {
     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
     if (mul_t == nullptr) {
         rms_norm_f32_cuda(x_t, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
@@ -599,7 +598,7 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
             blocks_num, x_t, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
             mul_t, mul_stride_row, mul_stride_channel, mul_stride_sample,
             mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
-            nullptr, 0, 0, 0, zero_packed, zero_packed, zero_packed, zero_packed, stream);
+            nullptr, 0, 0, 0, zero_packed, zero_packed, zero_packed, zero_packed, stream, 1.0f, q8_ctx, q8_tensor);
     } else {
         const uint3 add_ncols_packed     = init_fastdiv_values(add_ncols);
         const uint3 add_nrows_packed     = init_fastdiv_values(add_nrows);
@@ -810,10 +809,8 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
 
-    if (mul_tensor->type == GGML_TYPE_F32 && ne01 == 1 && ne02 == 1 && ne03 == 1 && ne00 % MATRIX_ROW_PADDING == 0) {
-        rms_norm_q8_1_ctx    = &ctx;
-        rms_norm_q8_1_tensor = mul_tensor;
-    }
+    // a single F32 row may feed a quantized matrix-vector product: let the kernel write its q8_1 copy too
+    const bool write_q8_1 = mul_tensor->type == GGML_TYPE_F32 && ne01 == 1 && ne02 == 1 && ne03 == 1 && ne00 % MATRIX_ROW_PADDING == 0;
     rms_norm_launch_typed(mul_tensor, [&](auto * dst_d) {
         rms_norm_mul_f32_cuda(rms_norm_src, mul_src, nullptr, dst_d,
                               ne00, ne01, ne02, ne03,
@@ -822,7 +819,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                               mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
                               /*add_s00*/ 0, 0, 0,
                               0, 0, 0, 0,
-                              eps, stream);
+                              eps, stream, write_q8_1 ? &ctx : nullptr, write_q8_1 ? mul_tensor : nullptr);
     });
 }
 

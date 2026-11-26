@@ -18,7 +18,7 @@ void ggml_cuda_op_mul_mat_vec_q(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 // Forget the quantized src1 kept by ggml_cuda_mul_mat_vec_q; called at the start of every graph compute.
-void ggml_cuda_mmvq_q8_1_cache_reset();
+void ggml_cuda_mmvq_q8_1_cache_reset(ggml_backend_cuda_context & ctx);
 
 // Buffer for the quantized (q8_1) copy of src1, owned by src1 until another tensor claims it.
 void * ggml_cuda_mmvq_q8_1_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, size_t size, cudaStream_t stream, bool * hit);
