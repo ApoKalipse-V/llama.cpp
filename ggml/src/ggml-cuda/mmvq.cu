@@ -1535,6 +1535,42 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+struct ggml_cuda_q8_1_cache {
+    const void        * ctx    = nullptr;
+    const ggml_tensor * src1   = nullptr;
+    cudaStream_t        stream = nullptr;
+    void              * buf    = nullptr;
+    size_t              size   = 0;
+    int                 device = -1;
+};
+static thread_local ggml_cuda_q8_1_cache ggml_cuda_q8_1_cache_tls;
+
+void ggml_cuda_mmvq_q8_1_cache_reset() {
+    ggml_cuda_q8_1_cache_tls.src1 = nullptr;
+}
+
+// Returns the buffer for the quantized copy of src1 and makes src1 its owner. *hit is set when the
+// buffer already holds src1 (then the caller must not write it again).
+void * ggml_cuda_mmvq_q8_1_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, size_t size, cudaStream_t stream, bool * hit) {
+    ggml_cuda_q8_1_cache & q8c = ggml_cuda_q8_1_cache_tls;
+    *hit = q8c.ctx == &ctx && q8c.src1 == src1 && q8c.stream == stream;
+    if (!*hit) {
+        if (q8c.size < size || q8c.device != ctx.device) {
+            if (q8c.buf != nullptr) {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                CUDA_CHECK(cudaFree(q8c.buf));
+            }
+            CUDA_CHECK(cudaMalloc(&q8c.buf, size));
+            q8c.size   = size;
+            q8c.device = ctx.device;
+        }
+        q8c.ctx    = &ctx;
+        q8c.src1   = src1;
+        q8c.stream = stream;
+    }
+    return q8c.buf;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1632,13 +1668,18 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    // The quantized copy of src1 is kept until the next graph compute: several products of one
+    // graph often read the same src1 tensor, and its data cannot change while it still has consumers.
+    const size_t src1_q8_1_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    bool q8_hit = false;
+    void * q8_buf = ggml_cuda_mmvq_q8_1_cache_claim(ctx, src1, src1_q8_1_size, stream, &q8_hit);
+    if (!q8_hit) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, q8_buf, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
+    struct { void * p; void * get() const { return p; } } src1_q8_1{q8_buf};
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;

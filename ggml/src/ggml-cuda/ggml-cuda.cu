@@ -5606,8 +5606,48 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// Thread-trace region instrumentation for `rocprofv3 --selected-regions`.
+// Inactive unless GGML_ROCTX_REGION=first:count is set: profiling is resumed before graph
+// compute number `first` (0-based) and paused after `count` consecutive graph computes, so a
+// trace covers the same work in every build, including the time between dispatches.
+#include <dlfcn.h>
+struct ggml_cuda_roctx_region {
+    typedef int (*roctx_fn)(uint64_t);
+    bool last = false;
+    roctx_fn pause = nullptr;
+    ggml_cuda_roctx_region() {
+        static const char * spec = getenv("GGML_ROCTX_REGION");
+        if (spec == nullptr) {
+            return;
+        }
+        static int first = 0;
+        static int count = 1;
+        static const int parsed = sscanf(spec, "%d:%d", &first, &count);
+        static std::atomic<int> calls{0};
+        static void * lib = dlopen("librocprofiler-sdk-roctx.so", RTLD_NOW | RTLD_GLOBAL);
+        const int n = calls++;
+        if (parsed < 1 || lib == nullptr || n < first || n >= first + count) {
+            return;
+        }
+        pause = (roctx_fn) dlsym(lib, "roctxProfilerPause");
+        roctx_fn resume = (roctx_fn) dlsym(lib, "roctxProfilerResume");
+        if (n == first && resume != nullptr) {
+            resume(0);
+        }
+        last = n == first + count - 1;
+    }
+    ~ggml_cuda_roctx_region() {
+        if (last && pause != nullptr) {
+            CUDA_CHECK(cudaDeviceSynchronize()); // let the region's kernels finish inside it
+            pause(0);
+        }
+    }
+};
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    ggml_cuda_roctx_region roctx_region;
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_mmvq_q8_1_cache_reset();
 
     ggml_cuda_set_device(cuda_ctx->device);
 

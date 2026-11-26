@@ -1,5 +1,6 @@
 #include "norm.cuh"
 #include "convert.cuh"
+#include "mmvq.cuh"
 #include <cstdint>
 
 template <int block_size, bool do_multiply = false, bool do_add = false>
@@ -149,7 +150,8 @@ static __global__ void rms_norm_f32(const T *     x,
                                     const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
                                     const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
                                     const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
-                                    const float   scale_out            = 1.0f) {
+                                    const float   scale_out            = 1.0f,
+                                    void *        q8                   = nullptr) {
     ggml_cuda_pdl_lc();
     const int nrows = gridDim.x;
     const int row   = blockIdx.x;
@@ -228,6 +230,29 @@ static __global__ void rms_norm_f32(const T *     x,
                             r.w *= scale_out;
                         }
                         rms_norm_store4(dstc, i, r);
+                        xs[k] = r;
+                    }
+                    // also write the result as q8_1 blocks (8 threads per block), as quantize_q8_1 would
+                    if (q8 != nullptr) {
+                        const float4 r = i < ncols4 ? xs[k] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                        float amax = fmaxf(fmaxf(fabsf(r.x), fabsf(r.y)), fmaxf(fabsf(r.z), fabsf(r.w)));
+                        amax = warp_reduce_max<8>(amax);
+                        const float  d  = amax / 127.0f;
+                        const int8_t q0 = amax == 0.0f ? 0 : roundf(r.x / d);
+                        const int8_t q1 = amax == 0.0f ? 0 : roundf(r.y / d);
+                        const int8_t q2 = amax == 0.0f ? 0 : roundf(r.z / d);
+                        const int8_t q3 = amax == 0.0f ? 0 : roundf(r.w / d);
+                        const int sum = warp_reduce_sum<8>((int) q0 + (int) q1 + (int) q2 + (int) q3);
+                        if (i < ncols4) {
+                            block_q8_1 * yb = (block_q8_1 *) q8 + i / 8;
+                            yb->qs[4*(i % 8) + 0] = q0;
+                            yb->qs[4*(i % 8) + 1] = q1;
+                            yb->qs[4*(i % 8) + 2] = q2;
+                            yb->qs[4*(i % 8) + 3] = q3;
+                            if (i % 8 == 0) {
+                                yb->ds = make_half2(d, d * sum);
+                            }
+                        }
                     }
                 }
             } else {
@@ -440,6 +465,11 @@ static void group_norm_f32_cuda(
     }
 }
 
+// Set by ggml_cuda_op_rms_norm_fused when its single-row F32 result may feed a quantized matrix-vector
+// product: the kernel then also writes the q8_1 copy, which saves the quantize_q8_1 dispatch.
+static thread_local ggml_backend_cuda_context * rms_norm_q8_1_ctx    = nullptr;
+static thread_local const ggml_tensor         * rms_norm_q8_1_tensor = nullptr;
+
 #define RMS_NORM_LAUNCH(BLOCK_SIZE, VPT, VEC) \
     do { \
         const dim3 block_dims(BLOCK_SIZE, 1, 1); \
@@ -449,7 +479,7 @@ static void group_norm_f32_cuda(
             mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
             mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
             add, add_stride_row, add_stride_channel, add_stride_sample, \
-            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out); \
+            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, q8); \
     } while (0)
 
 template <bool do_multiply, bool do_add, bool do_scale, typename T_add = float, typename T>
@@ -482,6 +512,12 @@ static void rms_norm_f32_dispatch(
     }
 
     const int n4 = ncols / 4;
+    void * q8 = nullptr;
+    if (rms_norm_q8_1_tensor != nullptr && vec && n4 <= 1024 && do_multiply && !do_add && std::is_same_v<T, float>) {
+        bool hit = false;
+        q8 = ggml_cuda_mmvq_q8_1_cache_claim(*rms_norm_q8_1_ctx, rms_norm_q8_1_tensor, ncols * sizeof(block_q8_1) / QK8_1, stream, &hit);
+    }
+    rms_norm_q8_1_tensor = nullptr;
     if (vec) {
         if (n4 <= 32) {
             RMS_NORM_LAUNCH(32,   1, true);
@@ -774,6 +810,10 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
 
+    if (mul_tensor->type == GGML_TYPE_F32 && ne01 == 1 && ne02 == 1 && ne03 == 1 && ne00 % MATRIX_ROW_PADDING == 0) {
+        rms_norm_q8_1_ctx    = &ctx;
+        rms_norm_q8_1_tensor = mul_tensor;
+    }
     rms_norm_launch_typed(mul_tensor, [&](auto * dst_d) {
         rms_norm_mul_f32_cuda(rms_norm_src, mul_src, nullptr, dst_d,
                               ne00, ne01, ne02, ne03,
