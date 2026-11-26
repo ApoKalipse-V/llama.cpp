@@ -511,7 +511,7 @@ static void rms_norm_f32_dispatch(
 
     const int n4 = ncols / 4;
     void * q8 = nullptr;
-    if (q8_tensor != nullptr && vec && n4 <= 1024 && do_multiply && !do_add && std::is_same_v<T, float>) {
+    if (q8_tensor != nullptr && vec && n4 <= 4096 && do_multiply && !do_add && std::is_same_v<T, float>) {
         bool hit = false;
         q8 = ggml_cuda_mmvq_q8_1_cache_claim(*q8_ctx, q8_tensor, ncols * sizeof(block_q8_1) / QK8_1, stream, &hit);
     }
