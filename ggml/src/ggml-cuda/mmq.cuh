@@ -1537,7 +1537,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
     // GCN and CDNA configs run several blocks per CU, so stream-k uses one block per occupancy slot.
-    const bool multi_block_cu = GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+    const bool multi_block_cu = GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
     const int stream_k_blocks = multi_block_cu ? nsm * config.occupancy : nsm;
 
     const int k_chunks = (args.ncols_x + config.K_vram - 1) / config.K_vram;
