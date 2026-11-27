@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "graph.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1549,6 +1550,11 @@ void * ggml_cuda_mmvq_q8_1_cache_claim(ggml_backend_cuda_context & ctx, const gg
             if (q8c.buf != nullptr) {
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 CUDA_CHECK(cudaFree(q8c.buf));
+#ifdef USE_CUDA_GRAPH
+                // captured graphs can still use the freed buffer, so they must be captured again
+                // (same as the buffer pool does when it frees memory)
+                ctx.cuda_graphs.clear();
+#endif // USE_CUDA_GRAPH
             }
             CUDA_CHECK(cudaMalloc(&q8c.buf, size));
             q8c.size = size;
