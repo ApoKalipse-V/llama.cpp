@@ -109,6 +109,10 @@ if (NOT GGML_HIP_MMQ_MFMA)
     add_compile_definitions(GGML_HIP_NO_MMQ_MFMA)
 endif()
 
+if (GGML_HIP_MMQ_Q6K_KPAIR)
+    add_compile_definitions(GGML_HIP_MMQ_Q6K_KPAIR)
+endif()
+
 if (GGML_HIP_RCCL)
     add_compile_definitions(GGML_USE_NCCL) # RCCL has the same interface as NCCL.
 endif()

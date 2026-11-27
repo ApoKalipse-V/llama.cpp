@@ -1029,6 +1029,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_MMQ_Q6K_KPAIR)
+    // Optional (cmake -DGGML_HIP_MMQ_Q6K_KPAIR=ON): slower by itself on RDNA4; it is the form the
+    // scheduling ledger for this kernel is keyed to and only pays off together with it.
     // Two k steps share the same y scale (dB changes every QI8_1 = 8 ints), so combine them
     // exactly in integer arithmetic and do a single int->float conversion and scaling.
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 8) {
@@ -1083,6 +1086,47 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             }
         }
     }
+#else
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
+        const int k0 = k00 + k01;
+
+        tile_A A[ntx];
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+            tile_B B;
+            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+
+            const int j = j0 + tile_C::get_j(0);
+            const float dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C;
+                mma(C, A[n], B);
+
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+                    const int8_t * sc = (const int8_t *) (x_sc + i*sram_stride + k00/16);
+#ifdef GGML_USE_HIP
+                    // |C.x| <= 16*32*127 (16 products of a 6 bit quant and an int8) and |sc| <= 128,
+                    // so both operands fit in 24 bits and the 24 bit multiply is exact.
+                    // A 32 bit vector multiply takes 4 cycles on AMD GPUs, the 24 bit one takes 1.
+                    const int C_sc = __mul24(C.x[l], sc[k01/4]);
+#else
+                    const int C_sc = C.x[l] * sc[k01/4];
+#endif // GGML_USE_HIP
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C_sc * x_df[i*sram_stride] * dB;
+                }
+            }
+        }
+    }
+#endif // GGML_USE_HIP && GGML_HIP_MMQ_Q6K_KPAIR
 #elif defined(TURING_MMA_AVAILABLE)
 
     typedef tile<16, 4, int> tile_A;
