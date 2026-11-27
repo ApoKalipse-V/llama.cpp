@@ -2800,6 +2800,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
         dst_slice.data   = dst_data_cur;
 
+        // src1_slice is a temporary that has the same address for every expert, so it must not
+        // match the cached q8_1 copy of a previous one.
+        ggml_cuda_mmvq_q8_1_cache_reset(ctx);
         ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
         CUDA_CHECK(cudaGetLastError());
 
